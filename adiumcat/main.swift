@@ -8,12 +8,8 @@
 
 import Foundation
 
-// MARK: -
-// MARK: Constants and helpers
-// MARK: -
+let adiumBasePath = NSURL(fileURLWithPath: "~/Library/Application Support/Adium 2.0/Users/Default/", isDirectory: true)
 
-let adiumBasePath = "~/Library/Application Support/Adium 2.0/Users/Default".stringByExpandingTildeInPath
-let accountPlistPath = adiumBasePath.stringByAppendingPathComponent("Accounts.plist")
 let fm = NSFileManager.defaultManager()
 
 let isodateFormatter = NSDateFormatter()
@@ -21,65 +17,45 @@ isodateFormatter.dateFormat = "yyyy'-'MM'-'dd'T'HH':'mm':'ssZ"
 isodateFormatter.locale = NSLocale(localeIdentifier: "en_US_POSIX")
 isodateFormatter.timeZone = NSTimeZone(forSecondsFromGMT: 0)
 
-// MARK: -
-// MARK: File mangling
-// MARK: -
-
-func logsDirs() -> [String] {
-    var fullNames = [String]()
-    
-    let basePath = adiumBasePath.stringByAppendingPathComponent("Logs")
-    let logsDirs = fm.contentsOfDirectoryAtPath(basePath, error: nil)
-    
-    for dir in logsDirs {
-        let dirString = dir as String
-        fullNames.append(basePath.stringByAppendingPathComponent(dirString))
-    }
-    
-    return fullNames
+func accountDirs() -> [NSURL]? {
+    let logsPath = adiumBasePath.URLByAppendingPathComponent("Logs")
+    return try? fm.contentsOfDirectoryAtURL(logsPath, includingPropertiesForKeys: nil, options: .SkipsHiddenFiles)
 }
 
-func allBuddies() ->[String] {
-    var allBuddies = [String]()
-    
-    for dir in logsDirs() {
-        var error : NSError?
-        
-        let buddies = fm.contentsOfDirectoryAtPath(dir, error: &error) as [String]?
-        
-        if !error {
-            for buddyDir in buddies! {
-                if buddyDir != ".DS_Store" {
-                    allBuddies.append(buddyDir)
-                }
-            }
-        }
+func allBuddies() -> [String] {
+    guard let accs = accountDirs() else {
+        return [String]()
     }
     
-    return sorted(allBuddies)
+    do {
+        return try accs
+            .flatMap { try fm.contentsOfDirectoryAtURL($0, includingPropertiesForKeys: nil, options: .SkipsHiddenFiles) }
+            .map { $0.lastPathComponent! }
+            .filter { $0 != nil }
+    }
+    catch {
+        return [String]()
+    }
 }
 
-func buddyDir(buddyName : String) -> String? {
-    for dir in logsDirs() {
-        var error : NSError?
-        
-        let buddies = fm.contentsOfDirectoryAtPath(dir, error: &error) as [String]?
-        
-        if !error {
-            for buddyDir in buddies! {
-                if buddyDir == buddyName {
-                    return dir.stringByAppendingPathComponent(buddyName)
-                }
-            }
-        }
+func buddyDir(buddyName : String) -> NSURL? {
+    guard let accs = accountDirs() else {
+        return nil
     }
     
-    return nil
+    do {
+        let err : NSErrorPointer = nil
+        
+        return try accs
+            .flatMap { try fm.contentsOfDirectoryAtURL($0, includingPropertiesForKeys: nil, options: .SkipsHiddenFiles) }
+            .map { $0.URLByAppendingPathComponent(buddyName) }
+            .filter({ $0.checkResourceIsReachableAndReturnError(err) })
+            .first
+    }
+    catch {
+        return nil
+    }
 }
-
-// MARK: -
-// MARK: Parsing
-// MARK: -
 
 class LogEvent {
     var alias  : String
@@ -90,11 +66,11 @@ class LogEvent {
         alias  : String,
         sender : String,
         time   : NSDate
-        )
+    )
     {
-            self.alias  = alias
-            self.sender = sender
-            self.time   = time
+        self.alias  = alias
+        self.sender = sender
+        self.time   = time
     }
     
     func toString() -> String {
@@ -110,7 +86,7 @@ class StatusEvent : LogEvent {
         alias  : String,
         sender : String,
         time   : NSDate
-        )
+    )
     {
         self.type = type
         super.init(alias: alias, sender: sender, time: time)
@@ -124,11 +100,11 @@ class StatusEvent : LogEvent {
 class MessageEvent : LogEvent {
     var message : String = ""
     
-    init(
-        alias   : String,
-        sender  : String,
-        time    : NSDate
-        )
+    override init(
+        alias  : String,
+        sender : String,
+        time   : NSDate
+    )
     {
         super.init(alias: alias, sender: sender, time: time)
     }
@@ -139,158 +115,132 @@ class MessageEvent : LogEvent {
 }
 
 class LogCollectorDelegate : NSObject, NSXMLParserDelegate {
-    var me : String = ""
-    var events : [LogEvent] = []
+    var me : String?
+    var events = [LogEvent]()
     var currentMessage : MessageEvent?
     
     func parser(
-        parser: NSXMLParser!,
-        didStartElement elementName: String!,
-        namespaceURI: String!,
-        qualifiedName qName: String!,
-        attributes attributeDict: [NSObject : AnyObject]!
-        )
+        parser: NSXMLParser,
+        didStartElement elementName: String,
+        namespaceURI: String?,
+        qualifiedName qName: String?,
+        attributes attrs: [String : String]
+    )
     {
         if elementName == "chat" {
-            let me: AnyObject? = attributeDict["account"]
-            if me {
-                self.me = me as String
-            }
+            self.me = attrs["account"]
         }
 
         if elementName == "status" {
-            let type:   AnyObject? = attributeDict["type"]
-            let alias:  AnyObject? = attributeDict["alias"]
-            let sender: AnyObject? = attributeDict["sender"]
-            let time:   AnyObject? = attributeDict["time"]
-            
-            if type && alias && sender && time {
-                let date = isodateFormatter.dateFromString(time! as String)
-                if date {
-                    let item = StatusEvent(
-                        type:   type!   as String,
-                        alias:  alias!  as String,
-                        sender: sender! as String,
-                        time:   date!
-                    )
-                    
-                    self.events.append(item)
-                }
+            if let t = attrs["type"], a = attrs["alias"], s = attrs["sender"], ti = attrs["time"] {
+                let time = isodateFormatter.dateFromString(ti)
+                let item = StatusEvent(
+                    type:   t,
+                    alias:  a,
+                    sender: s,
+                    time:   time! // FIXME
+                )
+                self.events.append(item)
             }
         }
         
         if elementName == "message" {
-            let alias:   AnyObject? = attributeDict["alias"]
-            let sender:  AnyObject? = attributeDict["sender"]
-            let time:    AnyObject? = attributeDict["time"]
-            
-            if alias && sender && time {
-                let date = isodateFormatter.dateFromString(time! as String)
-                if date {
-                    let item = MessageEvent(
-                        alias:   alias!  as String,
-                        sender:  sender! as String,
-                        time:    date!
-                    )
+            if let a = attrs["alias"], s = attrs["sender"], ti = attrs["time"] {
+                let time = isodateFormatter.dateFromString(ti)
+                let item = MessageEvent(
+                    alias:  a,
+                    sender: s,
+                    time:   time!
+                )
                     
-                    self.events.append(item)
-                    self.currentMessage = item
-                }
+                self.events.append(item)
+                self.currentMessage = item
             }
         }
     }
     
     func parser(
-        parser: NSXMLParser!,
-        didEndElement elementName: String!,
-        namespaceURI: String!,
-        qualifiedName qName: String!
-        )
+        parser: NSXMLParser,
+        didEndElement elementName: String,
+        namespaceURI: String?,
+        qualifiedName qName: String?
+    )
     {
         if elementName == "message" {
             currentMessage = nil
         }
     }
-    
-    func parser(parser: NSXMLParser!, foundCharacters string: String!) {
-        if self.currentMessage {
-            let message = self.currentMessage!
-            
-            let newMessage = message.message.stringByAppendingString(string)
-            message.message = newMessage
+
+    func parser(parser: NSXMLParser, foundCharacters string: String) {
+        if let message = self.currentMessage {
+            message.message.appendContentsOf(string)
         }
     }
 }
 
-func loadAllConversations(buddyDir : String) -> [LogEvent] {
-    var error : NSError?
+func loadAllConversations(buddyDir : NSURL) -> [LogEvent] {
+    guard let convs = try? fm.contentsOfDirectoryAtURL(buddyDir, includingPropertiesForKeys: nil, options: .SkipsHiddenFiles) else {
+        return [LogEvent]()
+    }
+
     var allXmls = [NSURL]()
     
-    let convs = fm.contentsOfDirectoryAtPath(buddyDir, error: &error) as [String]?
-    if !error {
-        for dayDir in convs! {
-            let filePath = buddyDir.stringByAppendingPathComponent(dayDir)
-            let fileName = dayDir.stringByReplacingOccurrencesOfString(".chatlog",
-                withString: ".xml",
-                options: NSStringCompareOptions.BackwardsSearch,
-                range: nil
-            )
-            let path = filePath.stringByAppendingPathComponent(fileName)
-            allXmls.append(NSURL(fileURLWithPath: path))
-        }
+    for dayDir in convs {
+        let fileName = dayDir.absoluteString.stringByReplacingOccurrencesOfString(
+            ".chatlog",
+            withString: ".xml",
+            options: NSStringCompareOptions.BackwardsSearch,
+            range: nil
+        )
+        allXmls.append(NSURL(fileURLWithPath: fileName))
     }
-    
-    // - //
-    
+
     let delegate = LogCollectorDelegate()
     for file in allXmls {
         let parser = NSXMLParser(contentsOfURL: file)
-        parser.delegate = delegate
-        parser.parse()
+        parser!.delegate = delegate
+        parser!.parse()
     }
-    
+
     return delegate.events
 }
 
-// MARK: -
-// MARK: CLI Usage
-// MARK: -
-
 func printAllBuddies() {
     for buddy in allBuddies() {
-        println(buddy)
+        print(buddy)
     }
     exit(0)
 }
 
 func printBuddy(name : String) {
     let dir = buddyDir(name)
-    if dir {
+    if (dir != nil) {
         let events = loadAllConversations(dir!)
         for e in events {
-            println(e.toString())
+            print(e.toString())
         }
         exit(0)
     } else {
-        println("logs for \"\(name)\" not found!")
+        print("logs for \"\(name)\" not found!")
         exit(2)
     }
 }
 
 func usage() {
     let program = Process.arguments[0]
-    println("usage: \(program) [buddy_name]")
+    print("usage: \(program) [buddy_name]")
     exit(1)
 }
 
+
 func main() {
-    let argc = countElements(Process.arguments)
-    
+    let argc = Process.arguments.count
+
     if argc == 1 {
         printAllBuddies()
     } else if argc == 2 {
         printBuddy(Process.arguments[1])
-    } else if argc > 3 {
+    } else {
         usage()
     }
 }
